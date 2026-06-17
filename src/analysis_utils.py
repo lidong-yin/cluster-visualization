@@ -21,7 +21,10 @@ def compute_variance(feats: np.ndarray) -> float:
 
 def group_sizes(df: pd.DataFrame, group_key: str) -> pd.DataFrame:
     s = df[group_key].value_counts(dropna=False)
-    out = s.rename("size").reset_index().rename(columns={"index": group_key})
+    out = s.rename("size").reset_index()
+    # In pandas 2.0+, reset_index preserves the original index name as the column name
+    if group_key not in out.columns:
+        out = out.rename(columns={out.columns[0]: group_key})
     return out
 
 

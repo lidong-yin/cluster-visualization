@@ -25,6 +25,19 @@ def get_default_annotation_path(data_path: str) -> str:
     return os.path.join(base_dir, f"{name_no_ext}_annotations.csv")
 
 
+def _strip_float_suffix(val: object) -> str:
+    """Convert string representation: strip trailing '.0' for integer-valued floats.
+
+    E.g., '123.0' -> '123', 'abc' -> 'abc', '1.5' -> '1.5'.
+    This handles the common case where pandas stores integer IDs as float64
+    and str() produces '123.0' instead of '123'.
+    """
+    s = str(val).strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        return s[:-2]
+    return s
+
+
 def load_or_create_annotations(path: str) -> pd.DataFrame:
     if os.path.exists(path):
         try:
@@ -33,6 +46,9 @@ def load_or_create_annotations(path: str) -> pd.DataFrame:
             for c in ANNO_COLS:
                 if c not in df.columns:
                     raise ValueError(f"Annotation file is missing required column: {c}")
+            # Normalize obj_id on load to match DataFrame's obj_id format
+            if "obj_id" in df.columns:
+                df["obj_id"] = df["obj_id"].astype(str).map(_strip_float_suffix)
             return df
         except Exception:
             return pd.DataFrame(columns=ANNO_COLS)
@@ -60,8 +76,8 @@ def append_annotation_rows(
     if os.path.exists(path):
         # Append mode
         new_df.to_csv(path, mode='a', header=False, index=False)
-        # Reload to return full
-        return pd.read_csv(path)
+        # Reload to return full (with normalized obj_id)
+        return load_or_create_annotations(path)
     else:
         # New file
         new_df.to_csv(path, index=False)
@@ -77,33 +93,27 @@ def create_split_records(
     """
     Generate rows for a split operation.
     new_labels should be aligned with obj_ids.
+
+    Label mapping strategy:
+    - If a label is a pure integer (e.g. from auto sub-clustering like 0, 1, 2),
+      it is prefixed with split_{source}_{uuid}_{local} to avoid collision with
+      existing cluster IDs in the DataFrame.
+    - If a label is a non-trivial string (user-specified batch label or move target),
+      it is kept as-is since the user chose it deliberately.
+    - Labels that look like "0" but were user-typed are indistinguishable from
+      auto labels, so they also get UUID prefix. Users should use descriptive names
+      for batch labels if they want to avoid prefixing.
     """
     now = time.time()
     records = []
-    # Generate UUID for each NEW cluster ID to ensure global uniqueness?
-    # Requirement: "target_cid: UUID or other unique identifier"
-    # new_labels are likely local cluster IDs (0, 1, 2...). 
-    # We should map local 0 -> UUID_A, local 1 -> UUID_B etc.
-    
+
     unique_locals = set(new_labels)
-    # Map local label -> UUID
-    # But if new_label is already a specific string (manual input), keep it?
-    # Let's assume input new_labels are temporary IDs (0, 1) or manual strings.
-    # If they look like temp ints, map to UUIDs.
-    
-    # Heuristic: if label is integer-like, map to UUID-based string to avoid collision
-    # with existing scalar IDs.
-    
     label_map = {}
     for L in unique_locals:
-        # Generate a unique target ID base
-        # Format: split_{source}_{random}_{local}
-        # Or just a UUID
         if isinstance(L, int) or (isinstance(L, str) and L.isdigit()):
-             label_map[L] = f"split_{source_cid}_{uuid.uuid4().hex[:6]}_{L}"
+            label_map[L] = f"split_{source_cid}_{uuid.uuid4().hex[:6]}_{L}"
         else:
-             # Assume manual input string is intentional
-             label_map[L] = str(L)
+            label_map[L] = str(L)
 
     for oid, lbl in zip(obj_ids, new_labels):
         records.append({
@@ -144,29 +154,34 @@ def apply_annotations_to_df(
         df[target_col] = None
 
     if base_col and base_col in df.columns:
-        # Initialize from base labels to avoid wiping existing clusters
-        df[target_col] = df[base_col].astype(str)
+        # Only initialize from base_col if target_col is missing or entirely NaN/None.
+        # This prevents wiping results from a previous annotation apply pass.
+        if df[target_col].isna().all():
+            df[target_col] = df[base_col].astype(str).map(_strip_float_suffix)
+        elif df[target_col].dtype == object and (df[target_col].astype(str) == "None").all():
+            df[target_col] = df[base_col].astype(str).map(_strip_float_suffix)
 
     work = anno_df.copy()
     work = work.dropna(subset=[obj_id_col, "target_cid"])
     if "time" in work.columns:
         work = work.sort_values("time")
-    def _normalize_obj_id(val: object) -> str:
-        s = str(val).strip()
-        if s.endswith(".0") and s[:-2].isdigit():
-            return s[:-2]
-        return s
 
-    work[obj_id_col] = work[obj_id_col].astype(str).map(_normalize_obj_id)
+    work[obj_id_col] = work[obj_id_col].astype(str).map(_strip_float_suffix)
     work["target_cid"] = work["target_cid"].astype(str)
 
     latest = work.groupby(obj_id_col, as_index=False).last()
     mapping = dict(zip(latest[obj_id_col], latest["target_cid"]))
 
-    obj_series = df[obj_id_col].astype(str).map(_normalize_obj_id)
+    obj_series = df[obj_id_col].astype(str).map(_strip_float_suffix)
     mask = obj_series.isin(mapping.keys())
     df.loc[mask, target_col] = obj_series[mask].map(mapping)
 
     if normalize_labels:
-        df[target_col] = pd.factorize(df[target_col])[0]
+        codes, uniques = pd.factorize(df[target_col])
+        # pd.factorize maps NaN to -1; replace with a proper label
+        na_mask = codes == -1
+        if na_mask.any():
+            max_code = int(codes.max()) if len(codes) > 0 else -1
+            codes[na_mask] = max_code + 1
+        df[target_col] = codes
     return int(mask.sum())

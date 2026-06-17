@@ -48,7 +48,8 @@ def main() -> None:
 
     if run_btn:
         if gt_col == pred_col:
-            st.warning("GT 列和预测列相同，指标可能无意义（全为 1.0）。")
+            st.error("GT 列和预测列不能相同，请选择不同的列。")
+            return
 
         # Prepare data: drop rows where either label is NaN
         # (Alternatively, fillna with a special 'unassigned' label, but dropping is safer for strict eval)

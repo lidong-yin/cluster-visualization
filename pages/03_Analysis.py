@@ -250,7 +250,7 @@ def _ensure_faiss_index(df: pd.DataFrame, cfg: dict, *, progress=None):
         index.add(feats[start:end])
         prog.progress(0.42 + 0.55 * (end / max(1, n)), text=f"构建 Faiss 索引：add {end:,}/{n:,}")
 
-    set_faiss(index, None, row_idx)
+    set_faiss(index, feats, row_idx)
     st.session_state[KEYS.faiss_meta] = expected
     prog.progress(1.0, text="Faiss 索引就绪")
     return index, row_idx

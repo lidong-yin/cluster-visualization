@@ -29,7 +29,8 @@ def _render_sidebar(df: pd.DataFrame):
     
     data_path = st.session_state.get(KEYS.data_path, "")
     default_anno = _get_anno_path(data_path)
-    anno_path = st.sidebar.text_input("标注文件路径 (.csv)", value=default_anno)
+    # Include data_path in key so the widget resets when data changes
+    anno_path = st.sidebar.text_input("标注文件路径 (.csv)", value=default_anno, key=f"anno_path_{data_path}")
     
     st.sidebar.divider()
     
@@ -175,14 +176,11 @@ def _render_merge_candidate_block(df, c_gid, main_gid, cand_idx, group_idx, cfg)
     
     # Keys
     select_all_key = f"merge_sel_all_{group_idx}_{cand_idx}_{c_gid}"
-    select_all_prev_key = f"{select_all_key}_prev"
-    
-    if select_all_key not in st.session_state:
-        st.session_state[select_all_key] = True
-    
+    select_all_prev_key = f"merge_sel_all_prev_{get_df_rev()}_{group_idx}_{cand_idx}_{c_gid}"
+
     c1, c2 = st.columns([2, 8])
     with c1:
-        select_all = st.checkbox("全选/全不选", key=select_all_key)
+        select_all = st.checkbox("全选/全不选", key=select_all_key, value=True)
     with c2:
         st.markdown(f"**🟠 候选簇: {c_gid}** (包含 {count} 张图片)")
     
@@ -246,16 +244,37 @@ def _render_merge_candidate_block(df, c_gid, main_gid, cand_idx, group_idx, cfg)
                     st.caption(f"{oid}")
     
     _render_expand_trigger(total=count, collapsed_n=limit, cfg=cfg, key_parts=["merge_cand", group_idx, c_gid])
-    
+
     st.markdown("---")
+    # Control for unrendered items
+    unrendered_count = max(0, count - len(indices[:limit]) if not expanded else count - len(show_idx))
+    if unrendered_count > 0:
+        include_hidden_key = f"merge_include_hidden_{group_idx}_{cand_idx}_{c_gid}"
+        include_hidden = st.checkbox(
+            f"同时合并未展示的 {unrendered_count} 张图片",
+            key=include_hidden_key,
+            value=True,
+        )
+    else:
+        include_hidden = True
+
     if st.button("✅ 确认合并到主簇", type="primary", key=f"merge_btn_{group_idx}_{cand_idx}_{c_gid}"):
         recs_to_save = []
         all_oids = [str(x) for x in c_df["obj_id"].tolist()]
         for oid in all_oids:
             item_key = f"merge_item_{group_idx}_{cand_idx}_{c_gid}_{oid}"
             if item_key not in st.session_state:
-                st.session_state[item_key] = True
-            if st.session_state.get(item_key, True):
+                # Item not rendered — use include_hidden decision
+                if include_hidden:
+                    recs_to_save.append({
+                        "time": time.time(),
+                        "anno_type": "MERGE",
+                        "obj_id": oid,
+                        "source_cid": str(c_gid),
+                        "target_cid": str(main_gid)
+                    })
+                continue
+            if st.session_state.get(item_key, False):
                 recs_to_save.append({
                     "time": time.time(),
                     "anno_type": "MERGE",
@@ -263,7 +282,7 @@ def _render_merge_candidate_block(df, c_gid, main_gid, cand_idx, group_idx, cfg)
                     "source_cid": str(c_gid),
                     "target_cid": str(main_gid)
                 })
-        
+
         if recs_to_save:
             annotation_utils.append_annotation_rows(cfg["anno_path"], recs_to_save)
             st.success(f"已合并 {len(recs_to_save)} 张图片到簇 {main_gid}！")
@@ -273,26 +292,33 @@ def _render_merge_candidate_block(df, c_gid, main_gid, cand_idx, group_idx, cfg)
             st.warning("未选中任何图片。")
 
 
-def _render_image_grid_with_input(df, img_col, obj_id_col, default_label_col, key_prefix, ncols):
+def _render_image_grid_with_moveout(df, img_col, obj_id_col, key_prefix, ncols, sub_label_map):
+    """Render image grid where each item can be 'moved out' from its sub-cluster.
+
+    sub_label_map: dict mapping obj_id -> the batch label of its sub-cluster.
+                   Used to display which sub-cluster each item belongs to.
+    For each visible item: a checkbox to mark for move-out, and a text_input
+    for the target label if moved.
+    """
     records = df.to_dict(orient="records")
     for i in range(0, len(records), ncols):
         cols = st.columns(ncols)
         for c, rec in zip(cols, records[i:i+ncols]):
             oid = str(rec.get(obj_id_col, ""))
             img = rec.get(img_col, "")
-            val_from_data = rec.get(default_label_col)
-            display_val = int(val_from_data) if val_from_data is not None else 0
             gt_label = rec.get("gt_person_id", None)
 
             with c:
                 try:
                     st.image(img, use_container_width=True)
-                except:
+                except Exception:
                     st.error("Img Error")
-                st.number_input(
-                    "Cluster ID", value=display_val, min_value=0, max_value=99999999, step=1,
-                    key=f"{key_prefix}_{oid}", label_visibility="collapsed"
-                )
+                move_key = f"{key_prefix}_move_{oid}"
+                st.checkbox("移出", key=move_key, value=False, label_visibility="visible")
+                target_key = f"{key_prefix}_target_{oid}"
+                default_target = str(sub_label_map.get(oid, "")) if oid in sub_label_map else ""
+                if st.session_state.get(move_key, False):
+                    st.text_input("移入标签", key=target_key, value=default_target, label_visibility="collapsed")
                 if gt_label is not None:
                     st.caption(f"{oid} | gt={gt_label}")
                 else:
@@ -301,8 +327,6 @@ def _render_image_grid_with_input(df, img_col, obj_id_col, default_label_col, ke
 
 def _load_annotations_df(path: str) -> pd.DataFrame:
     anno_df = annotation_utils.load_or_create_annotations(path)
-    if "obj_id" in anno_df.columns:
-        anno_df["obj_id"] = anno_df["obj_id"].astype(str)
     return anno_df
 
 
@@ -406,10 +430,17 @@ def main():
         st.session_state[cache_key] = (data_res, all_feats, all_row_idx)
     
     feat_pos_map = pd.Series(np.arange(len(all_row_idx)), index=all_row_idx)
-    
+
     # --- Rendering ---
+    if len(data_res) == 0:
+        st.info("当前模式下没有找到待标注的数据组。")
+        return
+
     start, end = cfg["start"] - 1, cfg["end"] - 1
     end = min(end, len(data_res) - 1)
+    if start > end:
+        st.info("起始组序号超出范围，请调整侧边栏设置。")
+        return
     
     with st.expander("标注信息", expanded=True):
         st.caption(f"当前标注文件: {cfg['anno_path']}")
@@ -437,52 +468,53 @@ def main():
                 if len(anno_df) == 0:
                     st.warning("标注文件为空，无法应用。")
                 else:
+                    apply_ok = False
                     try:
                         updated = annotation_utils.apply_annotations_to_df(
                             df,
                             anno_df,
                             out_col.strip(),
                             base_col=cfg["target_col"],
-                        normalize_labels=normalize_labels,
+                            normalize_labels=normalize_labels,
                         )
-                    except TypeError:
-                        # Backward compatibility for older annotation_utils signature
-                        if cfg["target_col"] in df.columns:
-                            df[out_col.strip()] = df[cfg["target_col"]].astype(str)
-                        updated = annotation_utils.apply_annotations_to_df(
-                            df,
-                            anno_df,
-                            out_col.strip(),
-                        )
-                        if normalize_labels:
-                            df[out_col.strip()] = pd.factorize(df[out_col.strip()])[0]
-                    st.session_state[KEYS.df] = df
-                    bump_df_rev()
-                    st.session_state["last_apply_info"] = {
-                        "col": out_col.strip(),
-                        "count": updated,
-                        "data_path": str(st.session_state.get(KEYS.data_path, "")),
-                    }
-                    if save_to_source:
-                        data_path = str(st.session_state.get(KEYS.data_path, ""))
-                        if not data_path:
-                            st.warning("保存失败：未找到原始输入文件路径。")
-                        else:
-                            try:
-                                data_utils.save_dataframe(df, data_path)
-                                st.success(f"已保存更新到源文件: `{data_path}`")
-                            except Exception as e:  # noqa: BLE001
-                                st.error(f"保存失败：{e}")
+                        apply_ok = True
+                    except Exception as e:
+                        st.error(f"应用标注失败：{e}")
+                        updated = 0
+                    if apply_ok:
+                        st.session_state[KEYS.df] = df
+                        bump_df_rev()
+                        st.session_state["last_apply_info"] = {
+                            "col": out_col.strip(),
+                            "count": updated,
+                            "data_path": str(st.session_state.get(KEYS.data_path, "")),
+                        }
+                        if save_to_source:
+                            data_path = str(st.session_state.get(KEYS.data_path, ""))
+                            if not data_path:
+                                st.warning("保存失败：未找到原始输入文件路径。")
+                            else:
+                                try:
+                                    data_utils.save_dataframe(df, data_path)
+                                    st.success(f"已保存更新到源文件: `{data_path}`")
+                                except Exception as e:  # noqa: BLE001
+                                    st.error(f"保存失败：{e}")
         c1, c2 = st.columns(2)
         with c1:
             if st.button("清空拆分标注", use_container_width=True, key="clear_split_anno"):
                 removed = _clear_annotations_by_type(cfg["anno_path"], "SPLIT")
-                st.success(f"已清空拆分标注 {removed} 条。")
+                if removed > 0:
+                    st.success(f"已清空拆分标注 {removed} 条。")
+                else:
+                    st.info("没有可清空的拆分标注。")
                 st.rerun()
         with c2:
             if st.button("清空合并标注", use_container_width=True, key="clear_merge_anno"):
                 removed = _clear_annotations_by_type(cfg["anno_path"], "MERGE")
-                st.success(f"已清空合并标注 {removed} 条。")
+                if removed > 0:
+                    st.success(f"已清空合并标注 {removed} 条。")
+                else:
+                    st.info("没有可清空的合并标注。")
                 st.rerun()
         anno_df = _load_annotations_df(cfg["anno_path"])
         if len(anno_df) == 0:
@@ -518,8 +550,9 @@ def main():
                 
                 sub_df = df[df[cfg["target_col"]] == gid].copy()
                 valid_idx = sub_df.index.intersection(all_row_idx)
-                sub_feats = all_feats[feat_pos_map.reindex(valid_idx).values.astype(int)]
-                
+                pos_values = feat_pos_map.reindex(valid_idx).dropna().values.astype(int)
+                sub_feats = all_feats[pos_values] if len(pos_values) > 0 else np.empty((0, all_feats.shape[1] if all_feats.ndim > 1 else 0), dtype=np.float32)
+
                 with st.expander("🛠️ 拆分工具", expanded=True):
                     c1, c2, c3 = st.columns([1, 2, 1])
                     with c1:
@@ -528,7 +561,7 @@ def main():
                         if method == "HAC": param = st.slider(f"Threshold", 0.0, 1.0, 0.48, 0.01, key=f"p_{i}")
                         elif method == "Infomap": param = st.slider(f"Threshold", 0.0, 1.0, 0.4, 0.01, key=f"p_{i}")
                         else: param = st.slider(f"K", 2, max(2, min(size, 50)), 2, 1, key=f"p_{i}")
-                    
+
                     if len(sub_feats) > 0:
                         pred = _run_sub_clustering(sub_feats, method, param)
                         sub_df["_temp"] = 0
@@ -536,43 +569,74 @@ def main():
                         c3.metric("当前拆分", f"{len(np.unique(pred))} 簇")
                     else:
                         sub_df["_temp"] = 0
-                
-                with st.form(key=f"split_{i}"):
-                    lbls = sorted(sub_df["_temp"].unique())
-                    for lbl in lbls:
-                        items = sub_df[sub_df["_temp"] == lbl]
-                        st.markdown(f"**🔹 Sub-cluster {lbl}** <span style='color:gray'>({len(items)})</span>", unsafe_allow_html=True)
-                        
-                        show_n = cfg["per_group_images"]
-                        if len(items) > show_n:
-                            st.caption(f"Show {show_n}/{len(items)}")
-                            items_show = items.head(show_n)
-                        else:
-                            items_show = items
-                            
-                        _render_image_grid_with_input(items_show, "img_url", "obj_id", "_temp", f"s_{i}_{lbl}", cfg["img_cols"])
-                        st.markdown('<div style="margin-bottom: 1.2rem;"></div>', unsafe_allow_html=True)
-                    
+
+                # --- Sub-cluster rendering (OUTSIDE form for interactive widgets) ---
+                lbls = sorted(sub_df["_temp"].unique())
+                sub_batch_labels = {}
+                for lbl in lbls:
+                    items = sub_df[sub_df["_temp"] == lbl]
+                    col_batch, col_count = st.columns([3, 2])
+                    with col_batch:
+                        batch_key = f"batch_{gid}_{lbl}"
+                        if batch_key not in st.session_state:
+                            st.session_state[batch_key] = str(lbl)
+                        batch_label = st.text_input(
+                            f"子簇 {lbl} 标签",
+                            key=batch_key,
+                            help="该子簇所有成员的默认目标标签。未展示的图片也使用此标签。"
+                        )
+                        sub_batch_labels[lbl] = batch_label.strip() if batch_label.strip() else str(lbl)
+                    with col_count:
+                        st.markdown(f"<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+                        st.markdown(f"**{len(items)}** 张图片")
+
+                    # Render visible items with move-out control
+                    show_n = cfg["per_group_images"]
+                    if len(items) > show_n:
+                        st.caption(f"展示 {show_n}/{len(items)} | 未展示的 {len(items) - show_n} 张图片将使用标签 `{sub_batch_labels[lbl]}`")
+
+                    if len(items) > 0:
+                        items_show = items.head(show_n)
+                        sub_label_map = {str(r["obj_id"]): sub_batch_labels[lbl] for _, r in items_show.iterrows()}
+                        _render_image_grid_with_moveout(
+                            items_show, "img_url", "obj_id",
+                            f"s_{gid}_{lbl}", cfg["img_cols"],
+                            sub_label_map,
+                        )
+                    st.markdown('<div style="margin-bottom: 1.0rem;"></div>', unsafe_allow_html=True)
+
+                # --- Confirm button (form just for the submit button) ---
+                with st.form(key=f"split_{gid}"):
                     if st.form_submit_button("✅ 确认拆分"):
                         recs = []
                         for lbl in lbls:
                             items = sub_df[sub_df["_temp"] == lbl]
                             limit = cfg["per_group_images"]
                             show_items = items.head(limit)
+                            batch_label = sub_batch_labels[lbl]
+
+                            # Process shown items: check if moved out
                             for _, r in show_items.iterrows():
                                 oid = str(r["obj_id"])
-                                k = f"s_{i}_{lbl}_{oid}"
-                                val = st.session_state.get(k, int(lbl))
-                                recs.append((oid, val))
+                                move_key = f"s_{gid}_{lbl}_move_{oid}"
+                                target_key = f"s_{gid}_{lbl}_target_{oid}"
+                                if st.session_state.get(move_key, False):
+                                    move_target = st.session_state.get(target_key, batch_label)
+                                    final_label = move_target.strip() if move_target.strip() else batch_label
+                                else:
+                                    final_label = batch_label
+                                recs.append((oid, final_label))
+
+                            # Hidden items: all get batch label (user is informed via caption above)
                             if len(items) > limit:
                                 for _, r in items.iloc[limit:].iterrows():
-                                    recs.append((str(r["obj_id"]), int(lbl)))
-                        
+                                    recs.append((str(r["obj_id"]), batch_label))
+
                         if recs:
                             oids, ls = zip(*recs)
                             rows = annotation_utils.create_split_records(list(oids), str(gid), list(ls))
                             annotation_utils.append_annotation_rows(cfg["anno_path"], rows)
-                            st.success("Saved!")
+                            st.success(f"已保存 {len(recs)} 条拆分标注！")
                             time.sleep(0.5)
                             st.rerun()
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import numpy as np
+import pandas as pd
 import streamlit as st
 from src import clustering_utils, data_utils, faiss_utils, ui_utils
 from src.state import KEYS, bump_df_rev, ensure_state, get_df, get_feature_col, set_feature_col
@@ -145,8 +146,10 @@ def _run_clustering(df, params: dict):
         raise ValueError("输出标签列名为空。请在侧边栏填写 out_col。")
 
     # Write back labels to df (align by row_idx)
-    df[out_col] = np.nan
-    df.loc[row_idx, out_col] = res.labels.astype(np.int32)
+    # Use object dtype to preserve integer labels without float coercion from NaN
+    df[out_col] = pd.NA
+    df[out_col] = df[out_col].astype(object)
+    df.loc[row_idx, out_col] = res.labels.astype(int).tolist()
     bump_df_rev()
 
     st.success(f"聚类完成：{method} | clusters={len(np.unique(res.labels)):,} | time={dt:.1f}s | out_col=`{out_col}`")
